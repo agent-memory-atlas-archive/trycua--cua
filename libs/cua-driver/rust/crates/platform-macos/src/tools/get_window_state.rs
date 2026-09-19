@@ -1103,6 +1103,7 @@ mod tests {
         actions: Vec<String>,
     ) -> AXNode {
         AXNode {
+            reference_unknown: 0,
             element_index: idx,
             role: role.into(),
             title: title.map(|s| s.to_string()),

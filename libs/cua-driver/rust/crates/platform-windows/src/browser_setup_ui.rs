@@ -723,6 +723,7 @@ mod tests {
 
     fn node(control_type: &str, name: &str, value: Option<&str>, actions: &[&str]) -> UiaNode {
         UiaNode {
+            reference_unknown: 0,
             element_index: (!actions.is_empty()).then_some(0),
             control_type: control_type.to_owned(),
             name: Some(name.to_owned()),

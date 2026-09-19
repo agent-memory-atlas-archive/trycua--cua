@@ -1713,6 +1713,7 @@ mod tests {
 
     fn node(role: &str, title: Option<&str>, value: Option<&str>, actions: &[&str]) -> AXNode {
         AXNode {
+            reference_unknown: 0,
             element_index: (!actions.is_empty()).then_some(0),
             role: role.to_owned(),
             title: title.map(str::to_owned),

@@ -1,16 +1,18 @@
 use super::{AtspiIdentity, AtspiNode};
 use cua_driver_core::element_token::{self, ResolvedElement};
 use cua_driver_core::protocol::ToolResult;
-pub fn reference_for_node(node: &AtspiNode) -> Vec<u8> {
-    serde_json::to_vec(&(
-        &node.role,
-        &node.name,
-        &node.description,
-        &node.actions,
+fn fields(node: &AtspiNode) -> serde_json::Value {
+    serde_json::json!([
+        node.role,
+        node.name,
+        node.description,
+        node.actions,
         node.depth,
-        node.in_web_content,
-    ))
-    .expect("AT-SPI identity tuple")
+        node.in_web_content
+    ])
+}
+pub fn reference_for_node(node: &AtspiNode) -> Vec<u8> {
+    cua_driver_core::reference_fields::encode("atspi2", fields(node), node.reference_unknown)
 }
 pub async fn resolve_element_args(
     pid: i32,
@@ -70,13 +72,21 @@ fn resolve_nodes(
     if !complete {
         return Err("incomplete accessibility tree cannot establish a unique element".into());
     }
-    let mut matches = nodes.into_iter().filter_map(|node| {
-        node.element_index
-            .filter(|_| reference_for_node(&node) == reference)
-            .map(|index| (index, node.identity))
-    });
-    let first = matches.next();
-    match first.filter(|_| matches.next().is_none()) {
+    use cua_driver_core::reference_fields::{ReferenceFields, ACTIONABILITY_UNKNOWN};
+    let target = ReferenceFields::decode(reference, "atspi2", 6)?;
+    let mut matched = None;
+    for node in nodes {
+        if node.element_index.is_none() && node.reference_unknown & ACTIONABILITY_UNKNOWN == 0 {
+            continue;
+        }
+        if target.matches(fields(&node), node.reference_unknown)? {
+            if matched.is_some() {
+                return Ok(None);
+            }
+            matched = node.element_index.map(|index| (index, node.identity));
+        }
+    }
+    match matched {
         None => Ok(None),
         Some((_, None)) => Err("matched element has no native AT-SPI identity".into()),
         Some((index, Some(identity))) => Ok(Some((index, identity))),
@@ -87,6 +97,7 @@ mod tests {
     use super::*;
     fn node(i: usize, name: &str) -> AtspiNode {
         AtspiNode {
+            reference_unknown: 0,
             element_index: Some(i),
             role: "button".into(),
             name: Some(name.into()),
@@ -103,6 +114,35 @@ mod tests {
             in_web_content: false,
         }
     }
+    #[test]
+    fn unrelated_metadata_error_does_not_block_atspi_reference() {
+        let mut button = node(0, "Save");
+        button.identity = Some(AtspiIdentity {
+            bus_name: ":1.42".into(),
+            path: "/button".into(),
+            frame_bus_name: ":1.42".into(),
+            frame_path: "/window".into(),
+        });
+        let reference = reference_for_node(&button);
+        let mut other = node(1, "Save");
+        other.role = "text".into();
+        other.reference_unknown = 1 << 1; // Name failed.
+        assert_eq!(
+            resolve_nodes(&reference, vec![other, button.clone()], true)
+                .unwrap()
+                .unwrap()
+                .0,
+            0
+        );
+        let mut possible_duplicate = button.clone();
+        possible_duplicate.reference_unknown = 1 << 1;
+        assert!(resolve_nodes(&reference, vec![button.clone(), possible_duplicate], true).is_err());
+        let mut uncertain = button.clone();
+        uncertain.element_index = None;
+        uncertain.reference_unknown = cua_driver_core::reference_fields::ACTIONABILITY_UNKNOWN;
+        assert!(resolve_nodes(&reference, vec![button, uncertain], true).is_err());
+    }
+
     #[test]
     fn atspi_reference_requires_one_complete_current_match() {
         let reference = reference_for_node(&node(0, "Save"));

@@ -56,17 +56,19 @@ impl Drop for FreshAxElements {
         }
     }
 }
-pub fn reference_for_node(n: &AXNode) -> Vec<u8> {
-    serde_json::to_vec(&(
-        &n.role,
-        &n.title,
-        &n.description,
-        &n.identifier,
-        &n.actions,
+fn fields(n: &AXNode) -> serde_json::Value {
+    serde_json::json!([
+        n.role,
+        n.title,
+        n.description,
+        n.identifier,
+        n.actions,
         n.depth,
-        n.in_web_content,
-    ))
-    .expect("AX identity tuple")
+        n.in_web_content
+    ])
+}
+pub fn reference_for_node(n: &AXNode) -> Vec<u8> {
+    cua_driver_core::reference_fields::encode("ax2", fields(n), n.reference_unknown)
 }
 pub async fn resolve_element_args(
     pid: i32,
@@ -108,12 +110,23 @@ fn resolve_nodes(
     if !complete {
         return Err("incomplete accessibility tree cannot establish a unique element".into());
     }
-    let mut matches = nodes.iter().filter_map(|node| {
-        node.element_index
-            .filter(|_| reference_for_node(node) == reference)
-    });
-    let first = matches.next();
-    Ok(first.filter(|_| matches.next().is_none()))
+    use cua_driver_core::reference_fields::{ReferenceFields, ACTIONABILITY_UNKNOWN};
+    let target = ReferenceFields::decode(reference, "ax2", 7)?;
+    let mut matched = None;
+    for node in nodes {
+        if node.element_index.is_none()
+            && (node.enabled == Some(false) || node.reference_unknown & ACTIONABILITY_UNKNOWN == 0)
+        {
+            continue;
+        }
+        if target.matches(fields(node), node.reference_unknown)? {
+            if matched.is_some() {
+                return Ok(None);
+            }
+            matched = node.element_index;
+        }
+    }
+    Ok(matched)
 }
 
 #[cfg(test)]
@@ -121,6 +134,7 @@ mod tests {
     use super::*;
     fn node(index: usize, title: &str) -> AXNode {
         AXNode {
+            reference_unknown: 0,
             element_index: Some(index),
             role: "AXButton".into(),
             title: Some(title.into()),
@@ -141,6 +155,45 @@ mod tests {
             selected: None,
             in_web_content: false,
         }
+    }
+
+    #[test]
+    fn unrelated_description_error_does_not_block_button_reference() {
+        let button = node(0, "Save");
+        let reference = reference_for_node(&button);
+        let mut other = node(1, "Save");
+        other.role = "AXTextArea".into();
+        other.reference_unknown = 1 << 2; // AXDescription failed, not absent.
+        assert_eq!(
+            resolve_nodes(&reference, &[button.clone(), other], true).unwrap(),
+            Some(0)
+        );
+        let mut possible_duplicate = button.clone();
+        possible_duplicate.reference_unknown = 1 << 2;
+        assert!(resolve_nodes(&reference, &[button.clone(), possible_duplicate], true).is_err());
+        let mut unknown_actionability = button.clone();
+        unknown_actionability.element_index = None;
+        unknown_actionability.reference_unknown =
+            cua_driver_core::reference_fields::ACTIONABILITY_UNKNOWN;
+        assert!(resolve_nodes(
+            &reference,
+            &[button.clone(), unknown_actionability.clone()],
+            true
+        )
+        .is_err());
+        unknown_actionability.enabled = Some(false);
+        assert_eq!(
+            resolve_nodes(&reference, &[button.clone(), unknown_actionability], true).unwrap(),
+            Some(0)
+        );
+        let mut unreadable_observation = button.clone();
+        unreadable_observation.reference_unknown = 1 << 2;
+        assert!(resolve_nodes(
+            &reference_for_node(&unreadable_observation),
+            &[button],
+            true
+        )
+        .is_err());
     }
 
     #[test]

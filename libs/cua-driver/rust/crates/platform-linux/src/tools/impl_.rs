@@ -1100,6 +1100,7 @@ mod get_window_state_actions_tests {
 
     fn node(actions: Vec<String>) -> AtspiNode {
         AtspiNode {
+            reference_unknown: 0,
             element_index: Some(1),
             role: "button".to_owned(),
             name: Some("ok".to_owned()),

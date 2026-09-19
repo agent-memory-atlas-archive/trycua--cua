@@ -52,6 +52,8 @@ const MAX_TOTAL_ELEMENTS: usize = DEFAULT_MAX_TOTAL_ELEMENTS;
 /// `_ptr is IAccessible` / `msaa_role = Some(...)` discriminator.
 #[derive(Clone)]
 pub struct UiaNode {
+    /// Failed identity-field reads (bit positions follow the backend reference tuple).
+    pub reference_unknown: u16,
     pub element_index: Option<usize>,
     pub control_type: String,
     pub name: Option<String>,
@@ -399,6 +401,7 @@ unsafe fn walk_tree_unsafe(
         0,
         None,
         false,
+        0,
         &mut nodes,
         &mut lines,
         &mut counter,
@@ -648,6 +651,7 @@ unsafe fn walk_cached(
         depth,
         None,
         false,
+        0,
         nodes,
         lines,
         counter,
@@ -663,6 +667,7 @@ unsafe fn walk_cached_bounded(
     depth: usize,
     parent_index: Option<usize>,
     in_web_content: bool,
+    inherited_unknown: u16,
     nodes: &mut Vec<UiaNode>,
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
@@ -674,23 +679,43 @@ unsafe fn walk_cached_bounded(
         return false;
     }
     *total += 1;
-    let mut complete = element.CachedControlType().is_ok()
-        && element.CachedName().is_ok()
-        && element.CachedAutomationId().is_ok()
-        && element.CachedHelpText().is_ok()
-        && element.CachedIsEnabled().is_ok();
-
-    let control_type = read_cached_control_type(element);
-    let name = read_cached_bstr_name(element);
+    use cua_driver_core::reference_fields::{read, ACTIONABILITY_UNKNOWN};
+    let mut complete = true;
+    let mut reference_unknown = inherited_unknown;
+    let control_type = read(
+        element
+            .CachedControlType()
+            .map(|ct| Some(control_type_name(ct.0))),
+        &mut reference_unknown,
+        1 | ACTIONABILITY_UNKNOWN,
+    )
+    .unwrap_or_else(|| "Unknown".into());
+    let name = checked_reference_text(element.CachedName(), &mut reference_unknown, 1 << 1);
     let value = read_cached_bstr_value(element);
-    let automation_id = read_cached_bstr(element, UIA_AutomationIdPropertyId);
-    let help_text = read_cached_bstr(element, UIA_HelpTextPropertyId);
-    let enabled = read_cached_bool(element, UIA_IsEnabledPropertyId);
+    let automation_id =
+        checked_reference_text(element.CachedAutomationId(), &mut reference_unknown, 1 << 2);
+    let help_text =
+        checked_reference_text(element.CachedHelpText(), &mut reference_unknown, 1 << 3);
+    let enabled = read(
+        element.CachedIsEnabled().map(|value| Some(value.as_bool())),
+        &mut reference_unknown,
+        ACTIONABILITY_UNKNOWN,
+    );
+    let child_unknown = inherited_unknown
+        | if reference_unknown & 1 != 0 && !in_web_content {
+            1 << 6
+        } else {
+            0
+        };
     // Missing UIA state must remain unknown on the structured observation
     // surface. Action discovery keeps its historical best-effort assumption.
     let is_enabled = enabled.unwrap_or(true);
     let selected = read_cached_selected(element);
-    let actions = detect_cached_actions(element, &control_type, is_enabled, &mut complete);
+    let mut actions_known = true;
+    let actions = detect_cached_actions(element, &control_type, is_enabled, &mut actions_known);
+    if !actions_known {
+        reference_unknown |= (1 << 4) | ACTIONABILITY_UNKNOWN;
+    }
     let is_actionable = !actions.is_empty() && is_enabled;
     let has_content = name
         .as_deref()
@@ -702,10 +727,16 @@ unsafe fn walk_cached_bounded(
             .unwrap_or(false);
 
     let mut emitted_parent: Option<usize> = parent_index;
-    if is_actionable || has_content {
-        let retained: IUIAutomationElement = element.clone();
-        let ptr = retained.as_raw() as usize;
-        std::mem::forget(retained);
+    if is_actionable || has_content || reference_unknown & ACTIONABILITY_UNKNOWN != 0 {
+        let ptr = if is_actionable || has_content {
+            let retained: IUIAutomationElement = element.clone();
+            let ptr = retained.as_raw() as usize;
+            std::mem::forget(retained);
+            ptr
+        } else {
+            // This candidate records uncertainty only; it cannot be dispatched.
+            0
+        };
 
         let node = if is_actionable {
             let idx = *counter;
@@ -713,6 +744,7 @@ unsafe fn walk_cached_bounded(
             let (center_x, center_y, rect) = read_cached_bounding_rect_full(element);
             emitted_parent = Some(idx);
             UiaNode {
+                reference_unknown,
                 element_index: Some(idx),
                 control_type: control_type.clone(),
                 name: name.clone(),
@@ -733,6 +765,7 @@ unsafe fn walk_cached_bounded(
             }
         } else {
             UiaNode {
+                reference_unknown,
                 element_index: None,
                 control_type: control_type.clone(),
                 name: name.clone(),
@@ -776,6 +809,7 @@ unsafe fn walk_cached_bounded(
                     depth + 1,
                     emitted_parent,
                     in_web_content || control_type.eq_ignore_ascii_case("Document"),
+                    child_unknown,
                     nodes,
                     lines,
                     counter,
@@ -790,26 +824,19 @@ unsafe fn walk_cached_bounded(
     complete
 }
 
-fn read_cached_control_type(element: &IUIAutomationElement) -> String {
-    unsafe {
-        element
-            .CachedControlType()
-            .ok()
-            .map(|ct| control_type_name(ct.0))
-            .unwrap_or_else(|| "Unknown".into())
-    }
-}
-
-fn read_cached_bstr_name(element: &IUIAutomationElement) -> Option<String> {
-    unsafe {
-        let bstr = element.CachedName().ok()?;
-        let s = bstr.to_string();
-        if s.trim().is_empty() {
-            None
-        } else {
-            Some(s)
-        }
-    }
+fn checked_reference_text(
+    value: windows::core::Result<BSTR>,
+    unknown: &mut u16,
+    field: u16,
+) -> Option<String> {
+    cua_driver_core::reference_fields::read(
+        value.map(|value| {
+            let text = value.to_string();
+            (!text.trim().is_empty()).then_some(text)
+        }),
+        unknown,
+        field,
+    )
 }
 
 fn read_cached_bstr_value(element: &IUIAutomationElement) -> Option<String> {

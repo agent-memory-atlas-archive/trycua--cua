@@ -62,10 +62,20 @@ Another observation alone does not invalidate the reference. It is not a
 persistent native handle or a guarantee that application state cannot change
 during dispatch.
 
-The current AX, UIA/MSAA and AT-SPI resolvers still require one matching
-description in a complete current traversal. Moving this policy out of the
-shared token interface does not relax those checks or fix known native
-incomplete-tree refusals. Backend-specific targeting improvements are separate.
+AX, UIA and AT-SPI resolve references against current candidates. A known
+identity-field difference excludes a candidate even when another field could
+not be read. If an unreadable field prevents ruling out a possible match,
+resolution refuses rather than treating that field as absent. Exactly one
+validated candidate is required. Failed child enumeration, traversal limits,
+uncertain window scope and fallback trees without structural proof still
+refuse; an unrelated optional metadata failure does not poison the whole tree.
+Native actionability and web-content classification remain checked.
+
+Backend payloads are versioned `ax2`, `uia2` and `atspi2`. They preserve the
+existing identity fields and distinguish failed reads from known absent values.
+Older unversioned backend payloads require re-observation. This does not promise
+that a control with unreadable identity can itself be acted on, nor does it
+provide automatic pixel fallback.
 
 The opaque token envelope is now `et2`: it contains an authenticated base64url
 reference payload rather than an identity fingerprint. Earlier `et1` tokens

@@ -675,6 +675,7 @@ mod tests {
 
     fn node(role: &str, name: &str, value: Option<&str>, actions: &[&str]) -> AtspiNode {
         AtspiNode {
+            reference_unknown: 0,
             element_index: (!actions.is_empty()).then_some(0),
             role: role.to_owned(),
             name: Some(name.to_owned()),

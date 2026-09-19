@@ -124,18 +124,20 @@ impl FreshUiaElements {
             .cloned()
     }
 }
-pub fn reference_for_node(node: &UiaNode) -> Vec<u8> {
-    serde_json::to_vec(&(
-        &node.control_type,
-        &node.name,
-        &node.automation_id,
-        &node.help_text,
-        &node.actions,
+fn fields(node: &UiaNode) -> serde_json::Value {
+    serde_json::json!([
+        node.control_type,
+        node.name,
+        node.automation_id,
+        node.help_text,
+        node.actions,
         node.depth,
         node.in_web_content,
-        node.msaa_role,
-    ))
-    .expect("UIA identity tuple")
+        node.msaa_role
+    ])
+}
+pub fn reference_for_node(node: &UiaNode) -> Vec<u8> {
+    cua_driver_core::reference_fields::encode("uia2", fields(node), node.reference_unknown)
 }
 pub async fn resolve_element_args(
     pid: i32,
@@ -191,12 +193,23 @@ fn resolve_nodes(
     if !complete {
         return Err("incomplete accessibility tree cannot establish a unique element".into());
     }
-    let mut matches = nodes.iter().filter_map(|node| {
-        node.element_index
-            .filter(|_| reference_for_node(node) == reference)
-    });
-    let first = matches.next();
-    Ok(first.filter(|_| matches.next().is_none()))
+    use cua_driver_core::reference_fields::{ReferenceFields, ACTIONABILITY_UNKNOWN};
+    let target = ReferenceFields::decode(reference, "uia2", 8)?;
+    let mut matched = None;
+    for node in nodes {
+        if node.element_index.is_none()
+            && (node.enabled == Some(false) || node.reference_unknown & ACTIONABILITY_UNKNOWN == 0)
+        {
+            continue;
+        }
+        if target.matches(fields(node), node.reference_unknown)? {
+            if matched.is_some() {
+                return Ok(None);
+            }
+            matched = node.element_index;
+        }
+    }
+    Ok(matched)
 }
 
 #[cfg(test)]
@@ -205,6 +218,7 @@ mod tests {
 
     fn node(index: usize, name: &str) -> UiaNode {
         UiaNode {
+            reference_unknown: 0,
             element_index: Some(index),
             control_type: "Button".into(),
             name: Some(name.into()),
@@ -223,6 +237,26 @@ mod tests {
             parent_element_index: None,
             in_web_content: false,
         }
+    }
+
+    #[test]
+    fn unrelated_metadata_error_does_not_block_uia_reference() {
+        let button = node(0, "Save");
+        let reference = reference_for_node(&button);
+        let mut other = node(1, "Save");
+        other.control_type = "Edit".into();
+        other.reference_unknown = 1 << 3; // Help text failed.
+        assert_eq!(
+            resolve_nodes(&reference, &[other, button.clone()], true).unwrap(),
+            Some(0)
+        );
+        let mut possible_duplicate = button.clone();
+        possible_duplicate.reference_unknown = 1 << 3;
+        assert!(resolve_nodes(&reference, &[button.clone(), possible_duplicate], true).is_err());
+        let mut uncertain = button.clone();
+        uncertain.element_index = None;
+        uncertain.reference_unknown = cua_driver_core::reference_fields::ACTIONABILITY_UNKNOWN;
+        assert!(resolve_nodes(&reference, &[button, uncertain], true).is_err());
     }
 
     #[test]

@@ -478,6 +478,7 @@ mod tests {
 
     fn node(control_type: &str, name: &str, actions: &[&str]) -> UiaNode {
         UiaNode {
+            reference_unknown: 0,
             element_index: None,
             control_type: control_type.to_owned(),
             name: Some(name.to_owned()),

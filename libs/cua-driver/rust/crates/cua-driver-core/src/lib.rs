@@ -71,6 +71,7 @@ pub mod recording_loader;
 pub mod recording_render;
 pub mod recording_tools;
 pub mod recording_zoom;
+pub mod reference_fields;
 pub mod server;
 pub mod session;
 pub mod session_authorization;

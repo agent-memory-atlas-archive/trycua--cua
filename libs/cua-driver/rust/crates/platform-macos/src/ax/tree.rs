@@ -14,6 +14,7 @@
 use super::bindings::*;
 use super::window_scope::{decide_window_scope, TopLevelCandidate, WindowScope};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
+use cua_driver_core::reference_fields::{read as read_field, ACTIONABILITY_UNKNOWN};
 
 /// Default maximum depth for AX tree walks. Deep menus and complex web views
 /// can nest deeply; 25 covers realistic app chrome without exploding on
@@ -47,6 +48,8 @@ unsafe fn set_messaging_timeout(element: AXUIElementRef) {
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
+    /// Failed identity-field reads (bit positions follow the backend reference tuple).
+    pub reference_unknown: u16,
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
     pub role: String,
@@ -135,7 +138,7 @@ fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<b
 pub struct TreeWalkResult {
     pub tree_markdown: String,
     pub nodes: Vec<AXNode>,
-    /// True when a traversal limit or failed accessibility read left the tree incomplete.
+    /// True when traversal/scope is incomplete. Candidate metadata failures are per-node.
     pub truncated: bool,
     /// Whether the requested `window_id` actually resolved to an AX surface,
     /// and if not, why. `None` when no `window_id` was requested.
@@ -258,18 +261,28 @@ pub fn walk_tree_bounded(
                     let role =
                         walk_value(copy_string_attr_checked(child, "AXRole"), &mut truncated)
                             .unwrap_or_default();
-                    let subrole =
-                        walk_value(copy_string_attr_checked(child, "AXSubrole"), &mut truncated);
-                    let identifier = walk_value(
-                        copy_string_attr_checked(child, "AXIdentifier"),
-                        &mut truncated,
-                    );
                     // Match AX window element → CGWindowID via private SPI.
                     // Only windows carry one, so skip the round-trip elsewhere.
                     let ax_window_id = if role == "AXWindow" {
                         ax_get_window_id(child)
                     } else {
                         None
+                    };
+                    // Dialog classification affects this window's allowed menu scope.
+                    // Other top-levels' optional metadata cannot affect that decision.
+                    let (subrole, identifier) = if ax_window_id == Some(wid) {
+                        (
+                            walk_value(
+                                copy_string_attr_checked(child, "AXSubrole"),
+                                &mut truncated,
+                            ),
+                            walk_value(
+                                copy_string_attr_checked(child, "AXIdentifier"),
+                                &mut truncated,
+                            ),
+                        )
+                    } else {
+                        (None, None)
                     };
                     TopLevelCandidate {
                         role,
@@ -300,6 +313,7 @@ pub fn walk_tree_bounded(
                 0,
                 None,
                 false,
+                0,
                 &mut nodes,
                 &mut lines,
                 &mut index_counter,
@@ -353,6 +367,7 @@ unsafe fn walk_element(
     depth: usize,
     parent_index: Option<usize>,
     in_web_content: bool,
+    inherited_unknown: u16,
     nodes: &mut Vec<AXNode>,
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
@@ -377,9 +392,22 @@ unsafe fn walk_element(
     // element, so every descendant must be bounded before any attribute read.
     set_messaging_timeout(element);
 
-    let role = walk_value(copy_string_attr_checked(element, "AXRole"), truncated)
-        .unwrap_or_else(|| "AXUnknown".into());
-
+    let mut reference_unknown = inherited_unknown;
+    let role = read_field(
+        copy_string_attr_checked(element, "AXRole"),
+        &mut reference_unknown,
+        1,
+    )
+    .unwrap_or_else(|| "AXUnknown".into());
+    if reference_unknown & 1 != 0 && !in_web_content {
+        reference_unknown |= 1 << 6;
+    }
+    let child_unknown = inherited_unknown
+        | if reference_unknown & 1 != 0 {
+            (1 << 5) | (reference_unknown & (1 << 6))
+        } else {
+            0
+        };
     let in_web_content = in_web_content || is_web_content_role(&role);
 
     // Skip pure layout containers that have no interesting content.
@@ -394,6 +422,7 @@ unsafe fn walk_element(
                 depth,
                 parent_index,
                 in_web_content,
+                child_unknown,
                 nodes,
                 lines,
                 counter,
@@ -412,7 +441,11 @@ unsafe fn walk_element(
     // This is critical for Calculator where AXTitle="" but AXDescription="2"
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
-    let title = walk_value(copy_string_attr_checked(element, "AXTitle"), truncated);
+    let title = read_field(
+        copy_string_attr_checked(element, "AXTitle"),
+        &mut reference_unknown,
+        1 << 1,
+    );
     // Read AXValue once with enough type information to preserve the existing
     // string-only markdown while also exposing numeric/boolean control state.
     let copied_value = copy_stringish_attr(element, "AXValue");
@@ -423,13 +456,22 @@ unsafe fn walk_element(
     let value = value
         .filter(|v| !v.trim().is_empty())
         .or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
-    let description = walk_value(
+    let description = read_field(
         copy_string_attr_checked(element, "AXDescription"),
-        truncated,
+        &mut reference_unknown,
+        1 << 2,
     );
-    let identifier = walk_value(copy_string_attr_checked(element, "AXIdentifier"), truncated);
+    let identifier = read_field(
+        copy_string_attr_checked(element, "AXIdentifier"),
+        &mut reference_unknown,
+        1 << 3,
+    );
     let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
-    let actions = walk_value(copy_action_names_checked(element), truncated);
+    let actions = read_field(
+        copy_action_names_checked(element),
+        &mut reference_unknown,
+        (1 << 4) | ACTIONABILITY_UNKNOWN,
+    );
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
@@ -445,19 +487,35 @@ unsafe fn walk_element(
     // extra AX round trip.
     let value_settable = actions.is_empty()
         && role_supports_value_addressing(&role)
-        && walk_value(is_attribute_settable_checked(element, "AXValue"), truncated);
+        && read_field(
+            is_attribute_settable_checked(element, "AXValue"),
+            &mut reference_unknown,
+            ACTIONABILITY_UNKNOWN,
+        );
+    if reference_unknown & 1 != 0 {
+        reference_unknown |= ACTIONABILITY_UNKNOWN;
+    }
     // A closed submenu can keep its descendants in AXChildren while reporting
     // those controls disabled. Never assign such a row a live element index:
     // the same native state also causes dispatch to refuse it, and exposing an
     // index for it invites agents to retain an unusable menu target.
     let enabled = if !actions.is_empty() || value_settable {
-        walk_value(copy_bool_attr_checked(element, "AXEnabled"), truncated)
+        read_field(
+            copy_bool_attr_checked(element, "AXEnabled"),
+            &mut reference_unknown,
+            ACTIONABILITY_UNKNOWN,
+        )
     } else {
         None
     };
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
-    if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
+    if !is_actionable
+        && reference_unknown & ACTIONABILITY_UNKNOWN == 0
+        && !has_content
+        && role != "AXWindow"
+        && role != "AXSheet"
+    {
         let children = walk_value(copy_element_array(element, "AXChildren"), truncated);
         for child in children {
             walk_element(
@@ -465,6 +523,7 @@ unsafe fn walk_element(
                 depth + 1,
                 parent_index,
                 in_web_content,
+                child_unknown,
                 nodes,
                 lines,
                 counter,
@@ -504,6 +563,7 @@ unsafe fn walk_element(
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
+            reference_unknown,
             element_index: Some(idx),
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -538,6 +598,7 @@ unsafe fn walk_element(
         }
     } else {
         AXNode {
+            reference_unknown,
             element_index: None,
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -588,6 +649,7 @@ unsafe fn walk_element(
             depth + 1,
             next_parent,
             in_web_content,
+            child_unknown,
             nodes,
             lines,
             counter,
@@ -760,6 +822,7 @@ mod tests {
                 1,
                 None,
                 false,
+                0,
                 &mut Vec::new(),
                 &mut Vec::new(),
                 &mut 0,

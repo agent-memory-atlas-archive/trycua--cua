@@ -1066,6 +1066,7 @@ mod get_window_state_actions_tests {
 
     fn node(actions: Vec<String>) -> UiaNode {
         UiaNode {
+            reference_unknown: 0,
             element_index: Some(1),
             control_type: "Button".to_owned(),
             name: Some("OK".to_owned()),

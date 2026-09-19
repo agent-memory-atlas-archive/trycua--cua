@@ -188,6 +188,7 @@ unsafe fn walk(
             let idx = *counter;
             *counter += 1;
             UiaNode {
+                reference_unknown: 0,
                 element_index: Some(idx),
                 control_type: control_type.clone(),
                 name: name.clone(),
@@ -208,6 +209,7 @@ unsafe fn walk(
             }
         } else {
             UiaNode {
+                reference_unknown: 0,
                 element_index: None,
                 control_type: control_type.clone(),
                 name: name.clone(),

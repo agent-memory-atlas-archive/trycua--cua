@@ -49,6 +49,8 @@ pub struct AtspiIdentity {
 
 #[derive(Clone, Debug)]
 pub struct AtspiNode {
+    /// Failed identity-field reads (bit positions follow the backend reference tuple).
+    pub reference_unknown: u16,
     pub element_index: Option<usize>,
     pub role: String,
     pub name: Option<String>,
@@ -330,6 +332,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
     let mut nodes = vec![];
 
     let root_node = AtspiNode {
+        reference_unknown: 0,
         element_index: Some(0),
         role: "window".into(),
         name: if title.is_empty() {

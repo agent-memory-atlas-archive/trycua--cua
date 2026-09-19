@@ -228,6 +228,7 @@ mod listener_startup_tests {
 /// A node discovered during the pre-order walk, with its proxy retained so the
 /// per-index operations can act on it without re-walking the tree.
 struct Visited<'a> {
+    reference_unknown: u16,
     depth: usize,
     role: String,
     /// Display text: the accessible `name`, or — for editable/text widgets that
@@ -762,11 +763,11 @@ async fn collect_visited_bounded<'a>(
         resolve_window_frame(conn, pid, xid, &seeds).await
     };
 
-    let mut stack: Vec<(RawObjectRef, usize, bool, usize)> = seeds
+    let mut stack: Vec<(RawObjectRef, usize, bool, usize, u16)> = seeds
         .iter()
         .cloned()
         .enumerate()
-        .map(|(ordinal, r)| (r, 0usize, false, ordinal))
+        .map(|(ordinal, r)| (r, 0usize, false, ordinal, 0))
         .rev()
         .collect();
 
@@ -791,7 +792,8 @@ async fn collect_visited_bounded<'a>(
     // few seconds rather than ~25s.
     let mut consecutive_timeouts = 0u32;
 
-    while let Some((oref, depth, inherited_web_doc, frame_ordinal)) = stack.pop() {
+    while let Some((oref, depth, inherited_web_doc, frame_ordinal, inherited_unknown)) = stack.pop()
+    {
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
             complete = false;
@@ -888,10 +890,18 @@ async fn collect_visited_bounded<'a>(
             call(acc.get_state()),
             call(raw_children(zconn, &oref)),
         );
-        complete &= matches!(&role_r, Some(Ok(_)))
-            && matches!(&name_r, Some(Ok(_)))
-            && matches!(&state_r, Some(Ok(_)))
-            && matches!(&children_r, Some(Ok(_)));
+        use cua_driver_core::reference_fields::ACTIONABILITY_UNKNOWN;
+        let mut reference_unknown = inherited_unknown;
+        if !matches!(&role_r, Some(Ok(_))) {
+            reference_unknown |= 1 | ACTIONABILITY_UNKNOWN;
+        }
+        if !matches!(&name_r, Some(Ok(_))) {
+            reference_unknown |= 1 << 1;
+        }
+        if !matches!(&state_r, Some(Ok(_))) {
+            reference_unknown |= ACTIONABILITY_UNKNOWN;
+        }
+        complete &= matches!(&children_r, Some(Ok(_)));
         let role = match role_r {
             Some(Ok(r)) => r,
             _ => String::new(),
@@ -947,7 +957,7 @@ async fn collect_visited_bounded<'a>(
                             .await
                             .and_then(|r| r.ok())
                             .unwrap_or_else(|| {
-                                complete = false;
+                                reference_unknown |= (1 << 3) | ACTIONABILITY_UNKNOWN;
                                 0
                             });
                         for i in 0..n {
@@ -961,13 +971,13 @@ async fn collect_visited_bounded<'a>(
                                     .await
                                     .and_then(|result| result.ok())
                                     .unwrap_or_else(|| {
-                                        complete = false;
+                                        reference_unknown |= (1 << 3) | ACTIONABILITY_UNKNOWN;
                                         String::new()
                                     }),
                             );
                         }
                     } else {
-                        complete = false;
+                        reference_unknown |= (1 << 3) | ACTIONABILITY_UNKNOWN;
                     }
                 }
                 if has_value {
@@ -987,7 +997,7 @@ async fn collect_visited_bounded<'a>(
                             .and_then(|r| r.ok())
                             .unwrap_or_else(|| {
                                 if name.trim().is_empty() {
-                                    complete = false;
+                                    reference_unknown |= 1 << 1;
                                 }
                                 0
                             });
@@ -996,15 +1006,20 @@ async fn collect_visited_bounded<'a>(
                             if let Some(Ok(t)) = call(tp.get_text(0, end)).await {
                                 text_content = t;
                             } else if name.trim().is_empty() {
-                                complete = false;
+                                reference_unknown |= 1 << 1;
                             }
                         }
                     } else if name.trim().is_empty() {
-                        complete = false;
+                        reference_unknown |= 1 << 1;
                     }
                 }
-            } else if has_action || (has_text && name.trim().is_empty()) {
-                complete = false;
+            } else {
+                if has_action {
+                    reference_unknown |= (1 << 3) | ACTIONABILITY_UNKNOWN;
+                }
+                if has_text && name.trim().is_empty() {
+                    reference_unknown |= 1 << 1;
+                }
             }
         }
 
@@ -1015,6 +1030,12 @@ async fn collect_visited_bounded<'a>(
 
         // Children inherit web-document context, plus this node's own role.
         let child_in_web_doc = in_web_doc || is_document_role(&role);
+        let child_unknown = inherited_unknown
+            | if reference_unknown & 1 != 0 && !in_web_doc {
+                1 << 5
+            } else {
+                0
+            };
 
         // Enqueue children (fetched above) before moving `acc` into `visited`.
         // Honor max_depth (#22865): skip enqueueing descendants whose depth
@@ -1027,7 +1048,7 @@ async fn collect_visited_bounded<'a>(
             match children_r {
                 Some(Ok(children)) => {
                     for c in children.into_iter().rev() {
-                        stack.push((c, depth + 1, child_in_web_doc, frame_ordinal));
+                        stack.push((c, depth + 1, child_in_web_doc, frame_ordinal, child_unknown));
                     }
                 }
                 Some(Err(error)) => dlog!("  get_children failed: {error:#}"),
@@ -1036,6 +1057,7 @@ async fn collect_visited_bounded<'a>(
         }
 
         visited.push(Visited {
+            reference_unknown,
             depth,
             role,
             name,
@@ -1113,25 +1135,15 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 .find_map(|d| parent_at_depth.get(d).copied().flatten())
         };
 
-        if is_indexable(v) {
-            if !emit {
-                // Consume the index without emitting: indices stay aligned with
-                // the application-wide walk the actuators perform.
-                idx += 1;
-                continue;
-            }
-            let act_str = v.actions.join(",");
-            let val_part = match &v.value {
-                Some(val) if !val.is_empty() => format!(" value=\"{val}\""),
-                _ => String::new(),
-            };
-            md.push_str(&format!(
-                "{indent}- [{idx}] {role} \"{name}\"{val_part} [actions=[{act_str}]]\n",
-                role = v.role,
-                name = v.name,
-            ));
+        let action_index = is_indexable(v).then_some(idx);
+        if emit
+            && (action_index.is_some()
+                || v.reference_unknown & cua_driver_core::reference_fields::ACTIONABILITY_UNKNOWN
+                    != 0)
+        {
             nodes.push(AtspiNode {
-                element_index: Some(idx),
+                reference_unknown: v.reference_unknown,
+                element_index: action_index,
                 role: v.role.clone(),
                 name: if v.name.is_empty() {
                     None
@@ -1150,6 +1162,26 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 parent_element_index,
                 in_web_content: v.in_web_doc,
             });
+        }
+
+        if is_indexable(v) {
+            if !emit {
+                // Consume the index without emitting: indices stay aligned with
+                // the application-wide walk the actuators perform.
+                idx += 1;
+                continue;
+            }
+            let act_str = v.actions.join(",");
+            let val_part = match &v.value {
+                Some(val) if !val.is_empty() => format!(" value=\"{val}\""),
+                _ => String::new(),
+            };
+            md.push_str(&format!(
+                "{indent}- [{idx}] {role} \"{name}\"{val_part} [actions=[{act_str}]]\n",
+                role = v.role,
+                name = v.name,
+            ));
+
             // Record this actionable index at its depth, and invalidate any
             // deeper entries from a previous subtree.
             while parent_at_depth.len() <= v.depth {
