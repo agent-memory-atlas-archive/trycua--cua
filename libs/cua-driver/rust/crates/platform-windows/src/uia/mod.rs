@@ -627,6 +627,7 @@ unsafe fn walk_root_by_pid(
             0,
             None,
             false,
+            0,
             nodes,
             lines,
             counter,
