@@ -62,6 +62,7 @@ pub mod health_report;
 pub mod history;
 pub mod image_utils;
 pub mod mcp_result;
+pub mod native_reference;
 pub mod page;
 pub mod pip_hook;
 pub mod policy;
